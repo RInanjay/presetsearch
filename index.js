@@ -61,9 +61,12 @@ app.get('/api/preset', async (req, res) => {
 
     let browser;
     const startedAt = Date.now();
+    const capturedComments = [];
+    const apiResponses = []; // Buat debug
 
     try {
-        console.log(`[${new Date().toISOString()}] Request: ${videoUrl}`);
+        console.log(`\n[${new Date().toISOString()}] ==================`);
+        console.log(`Request: ${videoUrl}`);
         console.log(`Cookie: ${cookie ? 'YES' : 'NO'}`);
         console.log(`Scroll: ${maxScroll}, Wait: ${waitMs}ms`);
 
@@ -90,7 +93,7 @@ app.get('/api/preset', async (req, res) => {
             }
         });
 
-        // === TAMBAH COOKIE KALO ADA ===
+        // === TAMBAH COOKIE ===
         if (cookie) {
             const cookies = parseCookieString(cookie);
             if (cookies.length > 0) {
@@ -107,7 +110,6 @@ app.get('/api/preset', async (req, res) => {
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
             Object.defineProperty(navigator, 'languages', { get: () => ['id-ID', 'id', 'en-US', 'en'] });
             
-            // Override chrome runtime
             window.chrome = {
                 runtime: {},
                 loadTimes: function() {},
@@ -116,23 +118,73 @@ app.get('/api/preset', async (req, res) => {
             };
         });
 
+        // === INTERCEPT SEMUA RESPONSE API TIKTOK ===
+        page.on('response', async (response) => {
+            const url = response.url();
+            
+            // Log semua API TikTok (buat debug)
+            if (url.includes('tiktok.com/api/')) {
+                apiResponses.push(url);
+            }
+
+            // === FILTER KOMENTAR ===
+            if (url.includes('/api/comment/list/') && !url.includes('/reply/')) {
+                try {
+                    const json = await response.json();
+                    const comments = json?.comments || [];
+                    
+                    for (const c of comments) {
+                        capturedComments.push({
+                            id: c.cid,
+                            text: c.text || '',
+                            likes: c.digg_count || 0,
+                            author: c.user?.unique_id || 'unknown',
+                            nickname: c.user?.nickname || '',
+                            is_pinned: c.is_author_digged || false,
+                            reply_count: c.reply_comment_total || 0
+                        });
+                    }
+                    
+                    console.log(`📥 Intercept ${comments.length} komentar (total: ${capturedComments.length})`);
+                } catch (e) {
+                    console.log(`⚠️ Gagal parse komentar: ${e.message}`);
+                }
+            }
+
+            // === FILTER REPLY KOMENTAR ===
+            if (url.includes('/api/comment/list/reply/')) {
+                try {
+                    const json = await response.json();
+                    const replies = json?.comments || [];
+                    
+                    for (const c of replies) {
+                        capturedComments.push({
+                            id: c.cid,
+                            text: c.text || '',
+                            likes: c.digg_count || 0,
+                            author: c.user?.unique_id || 'unknown',
+                            nickname: c.user?.nickname || '',
+                            is_reply: true,
+                            reply_count: 0
+                        });
+                    }
+                } catch (e) {}
+            }
+        });
+
         console.log('📥 Membuka halaman TikTok...');
         await page.goto(videoUrl, {
             waitUntil: 'domcontentloaded',
             timeout: 60000
         });
 
-        // Tunggu awal
         await page.waitForTimeout(5000);
 
-        // === TUTUP POPUP LOGIN KALO ADA ===
+        // === TUTUP POPUP LOGIN ===
         const closeSelectors = [
             '[data-e2e="modal-close-inner-button"]',
             'button[aria-label="Close"]',
-            'button[aria-label="Tutup"]',
-            '[data-e2e="browse-close"]',
-            '.close-icon',
-            'svg[class*="close"]'
+            '[data-e2e="browse-close"]'
         ];
 
         for (const sel of closeSelectors) {
@@ -140,96 +192,75 @@ app.get('/api/preset', async (req, res) => {
                 const btn = await page.$(sel);
                 if (btn) {
                     await btn.click();
-                    console.log(`✅ Popup ditutup dengan selector: ${sel}`);
-                    await page.waitForTimeout(1500);
+                    console.log(`✅ Popup ditutup`);
+                    await page.waitForTimeout(1000);
                     break;
                 }
             } catch (e) {}
         }
 
-        // === SCROLL LEBIH BANYAK & LAMA ===
-        console.log(`📜 Scroll ${maxScroll} kali...`);
+        // === TRIGGER LOAD KOMENTAR ===
+        console.log(`📜 Scroll & trigger komentar...`);
+        
         for (let i = 0; i < maxScroll; i++) {
-            await page.evaluate(() => window.scrollBy(0, window.innerHeight * 1.5));
+            // Scroll pelan
+            await page.evaluate(() => window.scrollBy(0, 300));
             await page.waitForTimeout(waitMs);
-            console.log(`   Scroll ${i + 1}/${maxScroll}`);
+            
+            // Coba klik tombol komentar kalo ada
+            try {
+                await page.evaluate(() => {
+                    const commentBtn = document.querySelector('[data-e2e="comment-icon"]');
+                    if (commentBtn) commentBtn.click();
+                });
+            } catch (e) {}
+            
+            // Scroll ke section komentar
+            await page.evaluate(() => {
+                const commentSection = document.querySelector('[data-e2e="comment-list"]');
+                if (commentSection) {
+                    commentSection.scrollIntoView({ behavior: 'smooth', block: 'end' });
+                }
+            });
+            
+            console.log(`   Iterasi ${i + 1}/${maxScroll} - ${capturedComments.length} komentar`);
+            
+            // Stop kalo udah dapet banyak
+            if (capturedComments.length > 200) break;
         }
 
-        // Scroll ke paling atas buat load pinned comment
-        console.log('📜 Scroll ke atas buat load pinned comment...');
-        await page.evaluate(() => window.scrollTo(0, 0));
+        // Tunggu komentar terakhir
         await page.waitForTimeout(3000);
 
-        // Scroll pelan-pelan lagi ke bawah biar komentar keload
-        console.log('📜 Scroll pelan-pelan lagi...');
-        for (let i = 0; i < 5; i++) {
-            await page.evaluate(() => window.scrollBy(0, window.innerHeight));
-            await page.waitForTimeout(2000);
-        }
-
-        // === AMBIL SEMUA TEXT ===
+        // === FALLBACK: AMBIL DARI HTML ===
         const pageText = await page.evaluate(() => document.body.innerText);
-
-        // === AMBIL SEMUA LINK DARI <a> ===
         const hrefLinks = await page.evaluate(() => {
-            const links = [];
-            document.querySelectorAll('a[href]').forEach(a => {
-                const href = a.href;
-                if (href && href.startsWith('http')) {
-                    links.push(href);
-                }
-            });
-            return links;
+            return Array.from(document.querySelectorAll('a[href]'))
+                .map(a => a.href)
+                .filter(h => h && h.startsWith('http'));
         });
 
-        // === AMBIL LINK DARI DATA ATTRIBUTE (komentar sering pake ini) ===
-        const dataLinks = await page.evaluate(() => {
-            const links = [];
-            
-            // Cari di elemen komentar
-            document.querySelectorAll('[data-e2e*="comment"]').forEach(el => {
-                const text = el.innerText || '';
-                const urls = text.match(/https?:\/\/[^\s]+/g) || [];
-                links.push(...urls);
-            });
-            
-            // Cari di semua span/p yang mengandung "http"
-            document.querySelectorAll('span, p, div').forEach(el => {
-                const text = el.innerText || '';
-                if (text.includes('http') && text.length < 500) {
-                    const urls = text.match(/https?:\/\/[^\s]+/g) || [];
-                    links.push(...urls);
-                }
-            });
-            
-            return links;
-        });
-
-        // === AMBIL CAPTION ===
         const caption = await page.evaluate(() => {
             const meta = document.querySelector('meta[property="og:description"]');
             return meta ? meta.content : '';
         }).catch(() => '');
 
-        // === AMBIL JUMLAH KOMENTAR (buat debug) ===
-        const commentCount = await page.evaluate(() => {
-            return document.querySelectorAll('[data-e2e*="comment-level"]').length;
-        }).catch(() => 0);
-
         await browser.close();
         browser = null;
 
-        // === GABUNG SEMUA LINK ===
-        const textUrls = pageText.match(/https?:\/\/[^\s]+/g) || [];
-        const allUrls = [...new Set([...textUrls, ...hrefLinks, ...dataLinks])];
-
-        // Filter Alight Motion
+        // === FILTER LINK ALIGHT ===
+        const commentTexts = capturedComments.map(c => c.text).join('\n');
+        const allText = pageText + '\n' + commentTexts;
+        
+        const textUrls = allText.match(/https?:\/\/[^\s]+/g) || [];
+        const allUrls = [...new Set([...textUrls, ...hrefLinks])];
         const presetLinks = allUrls.filter(isAlightUrl);
 
         const elapsed = Date.now() - startedAt;
 
-        console.log(`✅ Selesai ${elapsed}ms - ${presetLinks.length} preset dari ${allUrls.length} link`);
-        console.log(`📊 Komentar terdeteksi: ${commentCount}`);
+        console.log(`✅ Selesai ${elapsed}ms`);
+        console.log(`📊 Total: ${capturedComments.length} komentar, ${presetLinks.length} preset`);
+        console.log(`==================\n`);
 
         res.json({
             success: true,
@@ -240,11 +271,13 @@ app.get('/api/preset', async (req, res) => {
             scan: {
                 total_links: allUrls.length,
                 preset_found: presetLinks.length,
-                comments_detected: commentCount,
+                comments_detected: capturedComments.length,
+                api_calls: apiResponses.length,
                 cookie_used: !!cookie,
                 elapsed_ms: elapsed
             },
             presets: presetLinks,
+            comments: capturedComments.slice(0, 100),
             all_links: allUrls.slice(0, 50)
         });
 
@@ -261,16 +294,18 @@ app.get('/api/preset', async (req, res) => {
     }
 });
 
-// === ENDPOINT: DEBUG (buat lihat raw text) ===
+// === ENDPOINT DEBUG ===
 app.get('/api/debug', async (req, res) => {
     const videoUrl = req.query.url;
     const cookie = req.query.cookie || process.env.TIKTOK_COOKIE || '';
 
     if (!videoUrl) {
-        return res.status(400).json({ error: 'Parameter "url" wajib diisi' });
+        return res.status(400).json({ error: 'Parameter url wajib diisi' });
     }
 
     let browser;
+    const apiCalls = [];
+
     try {
         browser = await chromium.launch({
             headless: true,
@@ -288,25 +323,34 @@ app.get('/api/debug', async (req, res) => {
         }
 
         const page = await context.newPage();
+
+        page.on('response', (response) => {
+            const url = response.url();
+            if (url.includes('tiktok.com/api/')) {
+                apiCalls.push({
+                    url: url,
+                    status: response.status()
+                });
+            }
+        });
+
         await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
         await page.waitForTimeout(5000);
 
-        // Scroll
         for (let i = 0; i < 10; i++) {
-            await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+            await page.evaluate(() => window.scrollBy(0, 300));
             await page.waitForTimeout(2000);
         }
 
         const pageText = await page.evaluate(() => document.body.innerText);
-        const pageHtml = await page.content();
 
         await browser.close();
 
         res.json({
             success: true,
+            api_calls: apiCalls,
             text_length: pageText.length,
-            html_length: pageHtml.length,
-            text_preview: pageText.slice(0, 3000),
+            text_preview: pageText.slice(0, 2000),
             urls_found: (pageText.match(/https?:\/\/[^\s]+/g) || []).slice(0, 30)
         });
 
@@ -321,7 +365,7 @@ app.get('/', (req, res) => {
     res.json({
         status: 'ok',
         service: 'TikTok Preset Finder API',
-        version: '1.1.0',
+        version: '1.2.0',
         endpoints: {
             preset: '/api/preset?url=<tiktok_url>&scroll=10&wait=3000',
             debug: '/api/debug?url=<tiktok_url>',
